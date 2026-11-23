@@ -66,3 +66,7 @@ vcpkg_installed/
 # test output & cache
 Testing/
 .cache/
+
+# Installed bundles and Python test bytecode
+/dist/
+__pycache__/

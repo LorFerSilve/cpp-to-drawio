@@ -1,0 +1,82 @@
+name: Build and test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  linux:
+    name: Linux / Clang 18
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install LLVM and build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-18 llvm-18-dev libclang-18-dev libclang-cpp18-dev libtinyxml2-dev zlib1g-dev ninja-build
+      - name: Build and test both commands
+        run: |
+          clang++-18 --version
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang-18 -DCMAKE_CXX_COMPILER=clang++-18 -DCMAKE_PREFIX_PATH=/usr/lib/llvm-18
+          cmake --build build
+          ctest --test-dir build --output-on-failure
+          cmake --install build --prefix dist
+          dist/bin/cpp-to-drawio --help
+          dist/bin/drawio-to-cpp --help
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cpp-to-drawio-linux-x64
+          path: dist/
+          if-no-files-found: error
+
+  windows:
+    name: Windows / MSYS2 CLANG64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: msys2/setup-msys2@3c51bf698df1e37b2261f53cb67797b97761185c # v2
+        with:
+          msystem: CLANG64
+          update: true
+          install: >-
+            mingw-w64-clang-x86_64-clang
+            mingw-w64-clang-x86_64-clang-tools-extra
+            mingw-w64-clang-x86_64-llvm
+            mingw-w64-clang-x86_64-cmake
+            mingw-w64-clang-x86_64-ninja
+            mingw-w64-clang-x86_64-python
+            mingw-w64-clang-x86_64-tinyxml2
+            mingw-w64-clang-x86_64-zlib
+      - name: Build and test both commands
+        shell: msys2 {0}
+        run: |
+          set -e
+          clang++ --version
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ -DCMAKE_PREFIX_PATH="$(cygpath -m /clang64)"
+          cmake --build build
+          ctest --test-dir build --output-on-failure
+          cmake --install build --prefix dist
+      - name: Verify installed commands on the runner PATH
+        shell: pwsh
+        run: |
+          & .\dist\bin\cpp-to-drawio.exe --help
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & .\dist\bin\drawio-to-cpp.exe --help
+          exit $LASTEXITCODE
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: cpp-to-drawio-windows-x64
+          path: dist/
+          if-no-files-found: error
