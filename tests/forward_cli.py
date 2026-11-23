@@ -129,6 +129,7 @@ class ForwardCli(unittest.TestCase):
         result = self.convert("--create-output-dir", output=absent, status=3)
         self.assertRegex(result.stderr, r"broken file\.cpp:2:\d+: error:")
         self.assertIn("Analysis failed", result.stderr)
+        self.assertNotIn("order.cpp:1:1: error:", result.stderr)
         self.assertFalse(absent.parent.exists())
         self.diagram.write_bytes(b"keep me")
         self.convert("--force", status=3)

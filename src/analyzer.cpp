@@ -933,10 +933,11 @@ Analysis analyze(const fs::path& selected, const fs::path& compileDatabase, cons
             }
         }
     }
-    Diagnostics diagnostics;
+    std::set<std::string> errors;
+    std::set<std::string> warnings;
     Collected collected;
     for (const auto& file : files) {
-        std::size_t errorCount = diagnostics.errors.size();
+        Diagnostics diagnostics;
         ct::ClangTool tool(commands, {file});
         tool.setPrintErrorMessage(false);
         tool.appendArgumentsAdjuster([&](const auto& flags, llvm::StringRef) {
@@ -945,16 +946,18 @@ Analysis analyze(const fs::path& selected, const fs::path& compileDatabase, cons
         tool.setDiagnosticConsumer(&diagnostics);
         ActionFactory factory(source, collected);
         int status = tool.run(&factory);
-        if (status != 0 && diagnostics.errors.size() == errorCount) {
+        if (status != 0 && diagnostics.errors.empty()) {
             diagnostics.errors.insert(file + ":1:1: error: Clang could not analyze this translation unit.");
         }
+        errors.merge(diagnostics.errors);
+        warnings.merge(diagnostics.warnings);
     }
-    diagnostics.errors.insert(collected.conflicts.begin(), collected.conflicts.end());
-    if (!diagnostics.errors.empty()) {
-        throw AnalysisError(join(std::vector<std::string>(diagnostics.errors.begin(), diagnostics.errors.end()), "\n"));
+    errors.merge(collected.conflicts);
+    if (!errors.empty()) {
+        throw AnalysisError(join(std::vector<std::string>(errors.begin(), errors.end()), "\n"));
     }
     result.fileCount = files.size();
-    result.warnings.insert(result.warnings.end(), diagnostics.warnings.begin(), diagnostics.warnings.end());
+    result.warnings.insert(result.warnings.end(), warnings.begin(), warnings.end());
     for (auto& [name, definition] : collected.definitions) {
         result.model.types.push_back(std::move(definition.type));
     }
