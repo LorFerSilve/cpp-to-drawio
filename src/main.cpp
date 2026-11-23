@@ -25,6 +25,7 @@ Usage: cpp-to-drawio --source <directory> --output <file.drawio> [options]
   --compile-db <path>   compile_commands.json or its directory
   --create-output-dir   Create missing destination directories after analysis
   --overview            Create a namespace overview and detail pages
+  --no-static-analysis  Skip Clang's scan for potential defects
   --force               Allow replacing an existing output file
   --help                Show this help
 
@@ -79,7 +80,7 @@ int forward(int argc, char** argv, const fs::path& executable) {
     fs::path database;
     try {
         options = parse(argc, argv, 1, {"--source", "--output", "--compile-db"},
-                        {"--force", "--overview", "--create-output-dir"});
+                        {"--force", "--overview", "--create-output-dir", "--no-static-analysis"});
         if (!options.contains("--source") || !options.contains("--output")) {
             throw std::invalid_argument("Both --source and --output are required.");
         }
@@ -99,6 +100,7 @@ int forward(int argc, char** argv, const fs::path& executable) {
     }
     bool force = options.contains("--force");
     bool createDirectory = options.contains("--create-output-dir");
+    bool runStaticAnalysis = !options.contains("--no-static-analysis");
     try {
         validateDiagramOutput(output, force, createDirectory);
     } catch (const std::exception& error) {
@@ -108,7 +110,7 @@ int forward(int argc, char** argv, const fs::path& executable) {
 
     Analysis result;
     try {
-        result = analyze(source, database, executable);
+        result = analyze(source, database, executable, runStaticAnalysis);
     } catch (const AnalysisError& error) {
         llvm::errs() << "Analysis failed. No diagram was written.\n" << error.what() << '\n';
         return 3;
@@ -118,6 +120,10 @@ int forward(int argc, char** argv, const fs::path& executable) {
     }
     for (const auto& warning : result.warnings) {
         llvm::errs() << "Warning: " << warning << '\n';
+    }
+    for (const auto& finding : result.findings) {
+        llvm::errs() << finding.file << ':' << finding.line << ':' << finding.column
+                     << ": warning: " << finding.message << " [" << finding.checker << "]\n";
     }
     if (result.incomplete) {
         llvm::errs() << "Warning: Analysis is incomplete. See the diagnostics above.\n";
@@ -132,7 +138,11 @@ int forward(int argc, char** argv, const fs::path& executable) {
     }
     llvm::outs() << "Processed " << result.fileCount << " C++ files, " << result.model.types.size()
                  << " UML types, " << result.model.edges.size() << " relationships, " << result.warnings.size()
-                 << " warnings.\nWrote " << pathText(output) << '\n';
+                 << " warnings.\n";
+    if (runStaticAnalysis) {
+        llvm::outs() << "Static analysis findings: " << result.findings.size() << ".\n";
+    }
+    llvm::outs() << "Wrote " << pathText(output) << '\n';
     return 0;
 }
 

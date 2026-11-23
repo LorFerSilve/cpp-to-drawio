@@ -34,6 +34,30 @@ one consistent configuration. A Clang error or conflicting definition stops
 publication. Clean analysis with no named definitions produces an empty
 editable page and a warning.
 
+## Static analysis
+
+The Clang Static Analyzer shares the parsed translation unit and its compilation
+settings with the UML analysis. Its checks cover null pointer dereferences,
+uninitialized values, division by zero, references to expired storage, memory
+leaks, use after free, mismatched deallocation and unsafe library calls. It
+reports findings located in the selected source tree, including findings in
+headers reached through analyzed code. Repeated findings at the same location
+with the same check and message count once.
+[Clang checker reference](https://clang.llvm.org/docs/analyzer/checkers.html)
+
+Findings appear on standard error in this form.
+
+```text
+src/cache.cpp:24:12: warning: Dereference of null pointer [core.NullDereference]
+```
+
+The scan uses the project configurations in the selected compilation database
+and focuses path-sensitive analysis on individual translation units. The
+reported count reflects the paths Clang explored in that run. Files skipped
+because they lack a compilation command also fall outside the scan. Use
+`--no-static-analysis` when you want to export the diagram without running
+the additional checks.
+
 ## Relationships
 
 | Kind | Evidence | Appearance |

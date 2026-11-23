@@ -36,7 +36,8 @@ class ForwardCli(unittest.TestCase):
 
     def test_help_and_arguments(self):
         help_text = self.run_cli("--help").stdout
-        for flag in ("--source", "--output", "--compile-db", "--create-output-dir", "--overview", "--force"):
+        for flag in ("--source", "--output", "--compile-db", "--create-output-dir", "--overview", "--force",
+                     "--no-static-analysis"):
             self.assertIn(flag, help_text)
         self.assertIn("Unexpected argument --unknown", self.run_cli("--unknown", status=2).stderr)
         self.assertIn("Repeated argument --force", self.run_cli("--force", "--force", status=2).stderr)
@@ -50,6 +51,7 @@ class ForwardCli(unittest.TestCase):
 
         run = self.convert("--compile-db", self.db.parent)
         self.assertIn("Processed 2 C++ files, 9 UML types", run.stdout)
+        self.assertIn("Static analysis findings: 0.", run.stdout)
         self.assertEqual(run.stderr, "")
         self.assertFalse((self.project / "unused object.o").exists())
         (diagram,) = pages(self.diagram)
@@ -164,6 +166,91 @@ class ForwardCli(unittest.TestCase):
         self.assertIn(self.db.name, self.convert(status=2).stderr)
         self.db.write_text("[]", encoding="utf-8")
         self.assertIn("No C++ translation units", self.convert(status=2).stderr)
+        self.assertFalse(self.diagram.exists())
+
+    def test_static_analysis_follows_compile_flags_and_reports_potential_defects(self):
+        project = self.root / "Static analysis project"
+        project.mkdir()
+        (project / "checks.cpp").write_text(
+            """#include <cstring>
+
+struct Checks {
+    static int read(bool enabled) {
+        int value = 42;
+#ifdef BAD_PATH
+        const int* pointer = enabled ? &value : nullptr;
+        return *pointer;
+#else
+        return enabled ? value : 0;
+#endif
+    }
+
+    static int allocate() {
+        int* value = new int{42};
+        return *value;
+    }
+
+    static void copy(char* destination, const char* source) {
+        std::strcpy(destination, source);
+    }
+};
+""", encoding="utf-8")
+        flags = ("-std=c++17", "-Werror")
+        database(project, [entry(COMPILER, project, "checks.cpp", *flags, "-DBAD_PATH")])
+        result = self.run_cli("--source", project, "--output", self.diagram)
+        self.assertIn("Static analysis findings: 3.", result.stdout)
+        self.assertRegex(result.stderr, r"checks\.cpp:8:\d+: warning: .*\[core\.NullDereference\]")
+        self.assertRegex(result.stderr, r"checks\.cpp:\d+:\d+: warning: .*\[cplusplus\.NewDeleteLeaks\]")
+        self.assertRegex(result.stderr, r"checks\.cpp:\d+:\d+: warning: .*\[security\.insecureAPI\.strcpy\]")
+        self.assertIn("type:Checks", pages(self.diagram)[0].vertices())
+
+        without_scan = self.root / "Without scan.drawio"
+        disabled = self.run_cli("--source", project, "--output", without_scan, "--no-static-analysis")
+        self.assertNotIn("Static analysis findings:", disabled.stdout)
+        self.assertEqual(disabled.stderr, "")
+        self.assertEqual(self.diagram.read_bytes(), without_scan.read_bytes())
+
+        database(project, [entry(COMPILER, project, "checks.cpp", *flags)])
+        result = self.run_cli("--source", project, "--output", self.diagram, "--force")
+        self.assertIn("Static analysis findings: 2.", result.stdout)
+        self.assertNotIn("[core.NullDereference]", result.stderr)
+
+    def test_static_analysis_deduplicates_project_headers_and_filters_external_findings(self):
+        project = self.root / "Shared headers"
+        project.mkdir()
+        library = self.root / "External library"
+        library.mkdir()
+        function = """#pragma once
+inline int read_{name}(bool enabled) {{
+    int value = 42;
+    const int* pointer = enabled ? &value : nullptr;
+    return *pointer;
+}}
+"""
+        (project / "shared.hpp").write_text(function.format(name="shared"), encoding="utf-8")
+        (library / "external.hpp").write_text(function.format(name="external"), encoding="utf-8")
+        commands = []
+        for source in ("first", "second"):
+            (project / (source + ".cpp")).write_text(
+                '#include "shared.hpp"\n#include "external.hpp"\n'
+                f'int {source}_shared() {{ return read_shared(false); }}\n'
+                f'int {source}_external() {{ return read_external(false); }}\n',
+                encoding="utf-8")
+            commands.append(entry(COMPILER, project, source + ".cpp", "-std=c++17", "-I" + str(library)))
+        database(project, commands)
+        result = self.run_cli("--source", project, "--output", self.diagram)
+        self.assertEqual(result.stderr.count("[core.NullDereference]"), 1, result.stderr)
+        self.assertRegex(result.stderr, r"shared\.hpp:5:\d+: warning: .*\[core\.NullDereference\]")
+        self.assertNotIn("external.hpp:", result.stderr)
+        self.assertIn("Static analysis findings: 1.", result.stdout)
+
+    def test_static_analysis_preserves_compiler_werror(self):
+        project = self.root / "Warnings as errors"
+        project.mkdir()
+        (project / "warning.cpp").write_text("int missing_return() {}\n", encoding="utf-8")
+        database(project, [entry(COMPILER, project, "warning.cpp", "-std=c++17", "-Werror")])
+        result = self.run_cli("--source", project, "--output", self.diagram, status=3)
+        self.assertRegex(result.stderr, r"warning\.cpp:1:\d+: error: .*return")
         self.assertFalse(self.diagram.exists())
 
     def test_command_strings_and_duplicate_entries(self):

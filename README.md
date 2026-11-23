@@ -29,6 +29,7 @@ tab with full signatures and its internal relationships.
 | `--compile-db <path>` | Use this compilation database file or the directory that contains it. Omit to search the source directory and its ancestors for `compile_commands.json` or `build/compile_commands.json`. |
 | `--create-output-dir` | Create missing output directories after successful analysis. |
 | `--overview` | Add a compact overview followed by detailed namespace pages. |
+| `--no-static-analysis` | Skip the scan for potential defects. |
 | `--force` | Replace an existing regular file, including any edits made in Draw.io. |
 | `--help` | Show usage and exit. |
 
@@ -36,6 +37,13 @@ Clang uses the working directory, include paths, macros, language standard and
 other compiler flags from each command. The summary counts translation units,
 types, relationships and warnings. Diagnostics go to standard error with
 file, line and column where available.
+
+Each export also runs the Clang Static Analyzer on the parsed code. It reports
+possible defects such as null pointer dereferences, use after free, memory
+leaks and unsafe library calls. Findings include a source location and a
+checker ID, and the summary gives their count. The diagram is written when
+the source parses successfully, even when the scan finds issues.
+[Analysis and scan details](docs/analysis.md)
 
 | Exit code | Meaning |
 | --- | --- |

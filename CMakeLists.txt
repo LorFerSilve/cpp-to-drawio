@@ -49,7 +49,7 @@ target_compile_definitions(cpp-to-drawio PRIVATE
 if(TARGET clang-cpp AND TARGET LLVM)
     target_link_libraries(cpp-to-drawio PRIVATE clang-cpp LLVM)
 else()
-    target_link_libraries(cpp-to-drawio PRIVATE clangTooling clangAST clangFrontend clangBasic LLVMSupport)
+    target_link_libraries(cpp-to-drawio PRIVATE clangTooling clangAST clangFrontend clangBasic clangStaticAnalyzerFrontend LLVMSupport)
 endif()
 target_link_libraries(cpp-to-drawio PRIVATE tinyxml2::tinyxml2 ZLIB::ZLIB)
 if(MSVC)

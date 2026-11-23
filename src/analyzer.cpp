@@ -7,11 +7,15 @@
 #include <clang/AST/DeclTemplate.h>
 #include <clang/AST/ExprCXX.h>
 #include <clang/AST/QualTypeNames.h>
+#include <clang/Analysis/PathDiagnostic.h>
 #include <clang/Basic/Diagnostic.h>
 #include <clang/Basic/SourceManager.h>
 #include <clang/Frontend/CompilerInstance.h>
 #include <clang/Frontend/FrontendAction.h>
+#include <clang/Frontend/MultiplexConsumer.h>
 #include <clang/Lex/Lexer.h>
+#include <clang/StaticAnalyzer/Core/AnalyzerOptions.h>
+#include <clang/StaticAnalyzer/Frontend/AnalysisConsumer.h>
 #include <clang/Tooling/JSONCompilationDatabase.h>
 #include <clang/Tooling/Tooling.h>
 #include <llvm/Support/VirtualFileSystem.h>
@@ -89,6 +93,21 @@ std::string location(const clang::SourceManager& manager, SourceLocation where) 
            + std::to_string(position.getColumn());
 }
 
+std::optional<fs::path> sourcePath(const clang::SourceManager& manager, clang::FileID id) {
+    auto ref = manager.getFileEntryRefForID(id);
+    if (!ref) {
+        return std::nullopt;
+    }
+    auto real = ref->getFileEntry().tryGetRealPathName();
+    auto path = pathFromUtf8((real.empty() ? ref->getName() : real).str());
+    std::error_code error;
+    auto absolute = fs::weakly_canonical(path, error);
+    if (error || !absolute.is_absolute()) {
+        return std::nullopt;
+    }
+    return absolute;
+}
+
 class Diagnostics final : public clang::DiagnosticConsumer {
 public:
     std::set<std::string> warnings;
@@ -115,6 +134,69 @@ public:
         }
     }
 };
+
+class StaticAnalysisDiagnostics final : public clang::ento::PathDiagnosticConsumer {
+public:
+    StaticAnalysisDiagnostics(const fs::path& source, std::set<StaticAnalysisFinding>& findings)
+        : source_(source), findings_(findings) {}
+
+    llvm::StringRef getName() const override { return "cpp-to-drawio"; }
+    bool supportsCrossFileDiagnostics() const override { return true; }
+
+    void FlushDiagnosticsImpl(std::vector<const clang::ento::PathDiagnostic*>& diagnostics,
+                              FilesMade*) override {
+        for (const auto* diagnostic : diagnostics) {
+            auto report = diagnostic->getLocation();
+            if (!report.isValid() || !report.hasValidLocation()) {
+                continue;
+            }
+            const auto& manager = report.getManager();
+            auto where = manager.getExpansionLoc(report.asLocation());
+            auto path = sourcePath(manager, manager.getFileID(where));
+            if (path && !excluded(*path, source_)) {
+                findings_.insert({pathText(*path), manager.getSpellingLineNumber(where),
+                                  manager.getSpellingColumnNumber(where), diagnostic->getCheckerName().str(),
+                                  diagnostic->getShortDescription().str()});
+            }
+        }
+    }
+
+private:
+    const fs::path& source_;
+    std::set<StaticAnalysisFinding>& findings_;
+};
+
+void addDiagnosticConsumer(auto& analyzer, std::unique_ptr<clang::ento::PathDiagnosticConsumer> consumer) {
+    // Older Clang releases transfer ownership through a raw pointer.
+    if constexpr (requires { analyzer.AddDiagnosticConsumer(std::move(consumer)); }) {
+        analyzer.AddDiagnosticConsumer(std::move(consumer));
+    } else {
+        analyzer.AddDiagnosticConsumer(consumer.release());
+    }
+}
+
+std::unique_ptr<clang::ASTConsumer> createStaticAnalyzer(clang::CompilerInstance& compiler, const fs::path& source,
+                                                        std::set<StaticAnalysisFinding>& findings) {
+    auto& options = compiler.getAnalyzerOpts();
+    options.AnalysisDiagOpt = clang::PD_NONE;
+    options.CheckersAndPackages = {
+        {"core", true},
+        {"cplusplus.InnerPointer", true},
+        {"cplusplus.NewDelete", true},
+        {"cplusplus.NewDeleteLeaks", true},
+        {"unix.Malloc", true},
+        {"unix.MismatchedDeallocator", true},
+        {"security.insecureAPI", true},
+    };
+
+    auto& diagnostics = compiler.getDiagnostics();
+    bool warningsAsErrors = diagnostics.getWarningsAsErrors();
+    auto analyzer = clang::ento::CreateAnalysisConsumer(compiler);
+    // Creating Clang's analysis consumer disables -Werror for the invocation.
+    diagnostics.setWarningsAsErrors(warningsAsErrors);
+    addDiagnosticConsumer(*analyzer, std::make_unique<StaticAnalysisDiagnostics>(source, findings));
+    return analyzer;
+}
 
 class SelectedCommands final : public ct::CompilationDatabase {
 public:
@@ -298,15 +380,7 @@ private:
     std::optional<fs::path> file(clang::FileID id) {
         auto [entry, inserted] = files_.try_emplace(id.getHashValue());
         if (inserted) {
-            if (auto ref = manager_.getFileEntryRefForID(id)) {
-                auto real = ref->getFileEntry().tryGetRealPathName();
-                auto path = pathFromUtf8((real.empty() ? ref->getName() : real).str());
-                std::error_code error;
-                auto absolute = fs::weakly_canonical(path, error);
-                if (!error && absolute.is_absolute()) {
-                    entry->second = std::move(absolute);
-                }
-            }
+            entry->second = sourcePath(manager_, id);
         }
         return entry->second;
     }
@@ -844,12 +918,18 @@ private:
 
 class Action final : public clang::ASTFrontendAction {
 public:
-    Action(const fs::path& source, Collected& collected) : source_(source), collected_(collected) {}
+    Action(const fs::path& source, Collected& collected, std::set<StaticAnalysisFinding>* findings)
+        : source_(source), collected_(collected), findings_(findings) {}
 
     std::unique_ptr<clang::ASTConsumer> CreateASTConsumer(clang::CompilerInstance& compiler,
                                                          llvm::StringRef input) override {
         if (!compiler.getLangOpts().CPlusPlus) {
             collected_.conflicts.insert(input.str() + ":1:1: error: Compilation command did not select C++.");
+        } else if (findings_) {
+            std::vector<std::unique_ptr<clang::ASTConsumer>> consumers;
+            consumers.push_back(std::make_unique<Consumer>(source_, collected_));
+            consumers.push_back(createStaticAnalyzer(compiler, source_, *findings_));
+            return std::make_unique<clang::MultiplexConsumer>(std::move(consumers));
         }
         return std::make_unique<Consumer>(source_, collected_);
     }
@@ -857,19 +937,22 @@ public:
 private:
     const fs::path& source_;
     Collected& collected_;
+    std::set<StaticAnalysisFinding>* findings_;
 };
 
 class ActionFactory final : public ct::FrontendActionFactory {
 public:
-    ActionFactory(const fs::path& source, Collected& collected) : source_(source), collected_(collected) {}
+    ActionFactory(const fs::path& source, Collected& collected, std::set<StaticAnalysisFinding>* findings)
+        : source_(source), collected_(collected), findings_(findings) {}
 
     std::unique_ptr<clang::FrontendAction> create() override {
-        return std::make_unique<Action>(source_, collected_);
+        return std::make_unique<Action>(source_, collected_, findings_);
     }
 
 private:
     const fs::path& source_;
     Collected& collected_;
+    std::set<StaticAnalysisFinding>* findings_;
 };
 
 std::vector<std::string> analysisArguments(const std::vector<std::string>& original, const fs::path& resources) {
@@ -895,7 +978,8 @@ std::vector<std::string> analysisArguments(const std::vector<std::string>& origi
 
 }
 
-Analysis analyze(const fs::path& selected, const fs::path& compileDatabase, const fs::path& executable) {
+Analysis analyze(const fs::path& selected, const fs::path& compileDatabase, const fs::path& executable,
+                 bool runStaticAnalysis) {
     if (!fs::is_directory(selected)) {
         throw std::invalid_argument("Source directory does not exist or is not a directory: " + pathText(selected));
     }
@@ -935,7 +1019,9 @@ Analysis analyze(const fs::path& selected, const fs::path& compileDatabase, cons
     }
     std::set<std::string> errors;
     std::set<std::string> warnings;
+    std::set<StaticAnalysisFinding> findings;
     Collected collected;
+    ActionFactory factory(source, collected, runStaticAnalysis ? &findings : nullptr);
     for (const auto& file : files) {
         Diagnostics diagnostics;
         ct::ClangTool tool(commands, {file});
@@ -944,7 +1030,6 @@ Analysis analyze(const fs::path& selected, const fs::path& compileDatabase, cons
             return analysisArguments(flags, resources);
         });
         tool.setDiagnosticConsumer(&diagnostics);
-        ActionFactory factory(source, collected);
         int status = tool.run(&factory);
         if (status != 0 && diagnostics.errors.empty()) {
             diagnostics.errors.insert(file + ":1:1: error: Clang could not analyze this translation unit.");
@@ -958,6 +1043,7 @@ Analysis analyze(const fs::path& selected, const fs::path& compileDatabase, cons
     }
     result.fileCount = files.size();
     result.warnings.insert(result.warnings.end(), warnings.begin(), warnings.end());
+    result.findings.assign(findings.begin(), findings.end());
     for (auto& [name, definition] : collected.definitions) {
         result.model.types.push_back(std::move(definition.type));
     }
